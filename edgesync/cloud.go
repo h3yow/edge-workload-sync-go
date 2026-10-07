@@ -83,30 +83,83 @@ func (c *Cloud) UpdateDesired(workload string, baseVersion Version, token string
 
 // ReceiveChange 接收边缘上报的本地变更。重复 ID 幂等忽略（返回 nil）；
 // 基于已失效版本的变更以 ReasonStaleChange 拒绝，绝不静默应用。
+// 策略违规（未授权/超配额）同样拒绝。判定逻辑见 ApplyChange。
 func (c *Cloud) ReceiveChange(ch LocalChange) error {
+	res, err := c.ApplyChange(ch)
+	if err != nil {
+		return err
+	}
+	if res.Verdict == VerdictRejected {
+		return &RejectError{Reason: res.Reason, Workload: ch.Workload, Detail: res.Detail}
+	}
+	return nil
+}
+
+// ApplyChange 对一条边缘变更给出可区分的判定结果（生效/重复/拒绝及原因）。
+// 边缘本地变更与云端下发遵循同一套授权与配额策略：落在受保护工作负载上
+// 或携带受保护规格的变更必须携带有效令牌；规格变更的副本数不得超配额。
+// 返回的 error 仅表示内部持久化失败（调用方可重试），策略拒绝体现在
+// ChangeResult 中。无论在线直投还是断连重放，判定路径完全一致。
+func (c *Cloud) ApplyChange(ch LocalChange) (ChangeResult, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	d, ok := c.desiredLocked(ch.Workload)
 	if !ok {
-		return &RejectError{Reason: ReasonStaleChange, Workload: ch.Workload,
-			Detail: "unknown workload"}
+		return ChangeResult{Verdict: VerdictRejected, Reason: ReasonStaleChange,
+			Detail: "unknown workload"}, nil
 	}
 	if ch.BaseVersion < d.Version {
-		return &RejectError{Reason: ReasonStaleChange, Workload: ch.Workload,
-			Detail: "change based on superseded version"}
+		return ChangeResult{Verdict: VerdictRejected, Reason: ReasonStaleChange,
+			Detail: "change based on superseded version"}, nil
 	}
 	applied := c.appliedChangesLocked(ch.Workload)
 	if _, dup := applied[ch.ID]; dup {
-		return nil // 重复变更：幂等忽略，不重复生效
+		return ChangeResult{Verdict: VerdictDuplicate,
+			Detail: "duplicate change id, idempotently ignored"}, nil
 	}
-	status := c.statusLocked(ch.Workload)
-	status[ch.Key] = ch.Value
-	if err := c.putJSONLocked(statusKey(ch.Workload), status); err != nil {
-		return err
+	if res, bad := c.checkChangePolicyLocked(d, ch); bad {
+		return res, nil
+	}
+
+	// 通过全部校验：状态键值生效
+	if ch.Key != "" {
+		status := c.statusLocked(ch.Workload)
+		status[ch.Key] = ch.Value
+		if err := c.putJSONLocked(statusKey(ch.Workload), status); err != nil {
+			return ChangeResult{}, err
+		}
+	}
+	// 合规的规格变更提交为新的权威期望版本
+	if ch.Spec != nil {
+		next := DesiredState{
+			Workload: ch.Workload,
+			Version:  d.Version + 1,
+			Spec:     *ch.Spec,
+		}
+		if err := c.putDesiredLocked(next); err != nil {
+			return ChangeResult{}, err
+		}
 	}
 	applied[ch.ID] = struct{}{}
-	return c.putJSONLocked(changesKey(ch.Workload), applied)
+	if err := c.putJSONLocked(changesKey(ch.Workload), applied); err != nil {
+		return ChangeResult{}, err
+	}
+	return ChangeResult{Verdict: VerdictApplied}, nil
+}
+
+// checkChangePolicyLocked 对边缘变更执行与云端下发一致的授权与配额检查。
+func (c *Cloud) checkChangePolicyLocked(cur DesiredState, ch LocalChange) (ChangeResult, bool) {
+	protected := cur.Spec.Protected || (ch.Spec != nil && ch.Spec.Protected)
+	if protected && ch.Token != c.adminTok {
+		return ChangeResult{Verdict: VerdictRejected, Reason: ReasonUnauthorized,
+			Detail: "change on protected workload requires valid admin token"}, true
+	}
+	if ch.Spec != nil && c.maxRepl > 0 && ch.Spec.Replicas > c.maxRepl {
+		return ChangeResult{Verdict: VerdictRejected, Reason: ReasonQuotaExceeded,
+			Detail: "replicas exceed quota"}, true
+	}
+	return ChangeResult{}, false
 }
 
 // Desired 返回某工作负载当前的权威期望状态。

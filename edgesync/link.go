@@ -41,10 +41,24 @@ func (l *Link) Connected() bool {
 	return l.connected
 }
 
+// Cloud 返回链路对端的云端控制器（用于本地一致性查询）。
+func (l *Link) Cloud() *Cloud {
+	return l.cloud
+}
+
 // Deliver 向云端投递一条边缘变更；断连时返回 ErrLinkDown，由调用方暂存。
 func (l *Link) Deliver(ch LocalChange) error {
 	if !l.Connected() {
 		return ErrLinkDown
 	}
 	return l.cloud.ReceiveChange(ch)
+}
+
+// DeliverWithResult 向云端投递一条边缘变更并返回云端的逐条判定结果；
+// 断连时返回 ErrLinkDown，由调用方暂存。
+func (l *Link) DeliverWithResult(ch LocalChange) (ChangeResult, error) {
+	if !l.Connected() {
+		return ChangeResult{}, ErrLinkDown
+	}
+	return l.cloud.ApplyChange(ch)
 }

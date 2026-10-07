@@ -66,7 +66,7 @@ func TestDisconnectedReplay(t *testing.T) {
 
 	// 恢复连接，按序重放
 	link.Connect()
-	if err := edge.Reconnect(); err != nil {
+	if _, err := edge.Reconnect(); err != nil {
 		t.Fatal(err)
 	}
 	st := cloud.Status("app")
@@ -112,7 +112,7 @@ func TestStaleChangeRejectedOnReplay(t *testing.T) {
 
 	link.Connect()
 	t.Logf("输入: 重放基于 v1 的变更 %+v，云端当前版本 v2; 判定依据: BaseVersion < 当前版本，应以 StaleChange 拒绝", stale)
-	if err := edge.Reconnect(); err != nil {
+	if _, err := edge.Reconnect(); err != nil {
 		t.Fatal(err)
 	}
 	if st := cloud.Status("app"); len(st) != 0 {
