@@ -43,8 +43,15 @@ func (l *Link) Connected() bool {
 
 // Deliver 向云端投递一条边缘变更；断连时返回 ErrLinkDown，由调用方暂存。
 func (l *Link) Deliver(ch LocalChange) error {
+	_, err := l.DeliverResult(ch)
+	return err
+}
+
+// DeliverResult 与 Deliver 相同，但透传云端的结构化判定结果，
+// 使重放方能区分每条变更的结局（生效/重复/拒绝）。
+func (l *Link) DeliverResult(ch LocalChange) (ReceiveResult, error) {
 	if !l.Connected() {
-		return ErrLinkDown
+		return ReceiveResult{}, ErrLinkDown
 	}
-	return l.cloud.ReceiveChange(ch)
+	return l.cloud.ReceiveChangeResult(ch)
 }

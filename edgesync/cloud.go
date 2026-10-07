@@ -2,6 +2,8 @@ package edgesync
 
 import (
 	"encoding/json"
+	"fmt"
+	"strconv"
 	"sync"
 )
 
@@ -83,30 +85,52 @@ func (c *Cloud) UpdateDesired(workload string, baseVersion Version, token string
 
 // ReceiveChange 接收边缘上报的本地变更。重复 ID 幂等忽略（返回 nil）；
 // 基于已失效版本的变更以 ReasonStaleChange 拒绝，绝不静默应用。
+// 策略约束（授权/配额）与期望状态变更同等适用，见 ReceiveChangeResult。
 func (c *Cloud) ReceiveChange(ch LocalChange) error {
+	_, err := c.ReceiveChangeResult(ch)
+	return err
+}
+
+// ReceiveChangeResult 与 ReceiveChange 判定规则相同，但返回结构化结果，
+// 使调用方能区分"正常生效"与"重复忽略"，并获知判定时的云端版本。
+//
+// 判定顺序（云端锁内原子完成，并发推进版本不会张冠李戴）：
+//  1. 工作负载未知 → ReasonStaleChange；
+//  2. ID 已生效过 → 幂等忽略（Duplicate），无论其基准版本是否已失效；
+//  3. BaseVersion 低于当前版本 → ReasonStaleChange，绝不静默应用；
+//  4. 策略校验：受保护工作负载必须携带有效令牌（ReasonUnauthorized），
+//     Key 为 "replicas" 时不得超过配额（ReasonQuotaExceeded）；
+//  5. 全部通过才写入状态并记录幂等键，被拒绝的变更不污染权威状态。
+func (c *Cloud) ReceiveChangeResult(ch LocalChange) (ReceiveResult, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	d, ok := c.desiredLocked(ch.Workload)
 	if !ok {
-		return &RejectError{Reason: ReasonStaleChange, Workload: ch.Workload,
+		return ReceiveResult{}, &RejectError{Reason: ReasonStaleChange, Workload: ch.Workload,
 			Detail: "unknown workload"}
-	}
-	if ch.BaseVersion < d.Version {
-		return &RejectError{Reason: ReasonStaleChange, Workload: ch.Workload,
-			Detail: "change based on superseded version"}
 	}
 	applied := c.appliedChangesLocked(ch.Workload)
 	if _, dup := applied[ch.ID]; dup {
-		return nil // 重复变更：幂等忽略，不重复生效
+		return ReceiveResult{Duplicate: true, Version: d.Version}, nil // 重复变更：幂等忽略
+	}
+	if ch.BaseVersion < d.Version {
+		return ReceiveResult{Version: d.Version}, &RejectError{Reason: ReasonStaleChange, Workload: ch.Workload,
+			Detail: "change based on superseded version"}
+	}
+	if err := c.checkChangePolicyLocked(d, ch); err != nil {
+		return ReceiveResult{Version: d.Version}, err
 	}
 	status := c.statusLocked(ch.Workload)
 	status[ch.Key] = ch.Value
 	if err := c.putJSONLocked(statusKey(ch.Workload), status); err != nil {
-		return err
+		return ReceiveResult{}, err
 	}
 	applied[ch.ID] = struct{}{}
-	return c.putJSONLocked(changesKey(ch.Workload), applied)
+	if err := c.putJSONLocked(changesKey(ch.Workload), applied); err != nil {
+		return ReceiveResult{}, err
+	}
+	return ReceiveResult{Applied: true, Version: d.Version}, nil
 }
 
 // Desired 返回某工作负载当前的权威期望状态。
@@ -121,6 +145,28 @@ func (c *Cloud) Status(workload string) map[string]string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.statusLocked(workload)
+}
+
+// checkChangePolicyLocked 对边缘本地变更施加与期望状态变更同等的策略约束：
+// 受保护工作负载的变更必须携带有效令牌；Key 为 "replicas" 的变更按副本数
+// 解析并受配额约束。在线直投与断连重放都经过此判定，结果一致。
+func (c *Cloud) checkChangePolicyLocked(d DesiredState, ch LocalChange) error {
+	if d.Spec.Protected && ch.Token != c.adminTok {
+		return &RejectError{Reason: ReasonUnauthorized, Workload: ch.Workload,
+			Detail: "protected workload requires valid admin token"}
+	}
+	if ch.Key == "replicas" && c.maxRepl > 0 {
+		n, err := strconv.Atoi(ch.Value)
+		if err != nil {
+			return &RejectError{Reason: ReasonQuotaExceeded, Workload: ch.Workload,
+				Detail: fmt.Sprintf("replicas value %q is not a number", ch.Value)}
+		}
+		if n > c.maxRepl {
+			return &RejectError{Reason: ReasonQuotaExceeded, Workload: ch.Workload,
+				Detail: "replicas exceed quota"}
+		}
+	}
+	return nil
 }
 
 func (c *Cloud) checkPolicyLocked(d DesiredState) error {
